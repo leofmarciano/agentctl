@@ -17,7 +17,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: "1.88.0"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Verify MSRV toolchain
         run: rustc +1.88.0 --version --verbose
       - name: Check workspace with MSRV
@@ -33,7 +33,7 @@ jobs:
         with:
           toolchain: 1.96.0
           targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Build portable Linux release target
         run: cargo build --release --locked --target x86_64-unknown-linux-musl -p agentctl
 
@@ -49,7 +49,7 @@ jobs:
         with:
           toolchain: 1.96.0
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - name: Check native smoke script
         if: runner.os == 'Linux'
         run: |
@@ -67,7 +67,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: 1.96.0
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - run: cargo check --locked --workspace --all-targets --all-features
       - run: cargo test --locked --workspace --all-features
 
