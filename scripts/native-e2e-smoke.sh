@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# ABOUTME: Verifies native provider lifecycle and synchronization in a disposable workspace.
+# ABOUTME: Checks writer exclusion, transcript capture, mappings, and repeated synchronization.
 set -Eeuo pipefail
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
@@ -306,13 +308,17 @@ jq -e '
 note "running projection synchronization twice"
 (
   cd -- "$WORKSPACE"
-  "$AGENTCTL_BIN" --home "$STATE_DIR" --json sync "$SESSION_NAME" >/dev/null
+  "$AGENTCTL_BIN" --home "$STATE_DIR" --json sync "$SESSION_NAME" >"$LOG_DIR/sync-one.json"
 )
+jq -e 'all(.providers[]; has("error") | not)' "$LOG_DIR/sync-one.json" >/dev/null \
+  || die "provider synchronization failed: $(cat "$LOG_DIR/sync-one.json")"
 STATUS_AFTER_SYNC_ONE=$(status_json)
 (
   cd -- "$WORKSPACE"
-  "$AGENTCTL_BIN" --home "$STATE_DIR" --json sync "$SESSION_NAME" >/dev/null
+  "$AGENTCTL_BIN" --home "$STATE_DIR" --json sync "$SESSION_NAME" >"$LOG_DIR/sync-two.json"
 )
+jq -e 'all(.providers[]; has("error") | not)' "$LOG_DIR/sync-two.json" >/dev/null \
+  || die "provider synchronization failed: $(cat "$LOG_DIR/sync-two.json")"
 STATUS_AFTER_SYNC_TWO=$(status_json)
 
 jq -en \

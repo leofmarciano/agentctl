@@ -1,3 +1,5 @@
+// ABOUTME: Exchanges bounded Codex protocol messages over owned or shared connections.
+// ABOUTME: Correlates requests and closes only resources owned by this client.
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -9,15 +11,15 @@ use std::{
 
 use agentctl_core::{ProviderError, ProviderKind};
 use agentctl_workspace::{ProcessTree, configure_tokio_process_group};
-use futures::StreamExt;
+use futures::{Sink, SinkExt, Stream, StreamExt};
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, Command},
+    io::BufReader,
+    process::{Child, Command},
     sync::{Mutex, broadcast, mpsc, oneshot},
     time::timeout,
 };
-use tokio_util::codec::{FramedRead, LinesCodec};
+use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
 const MAX_PROTOCOL_LINE_BYTES: usize = 8 * 1024 * 1024;
 type PendingSender = oneshot::Sender<Result<Value, ProviderError>>;
@@ -54,14 +56,15 @@ pub(crate) struct RpcResponse {
 #[derive(Debug)]
 struct OutboundLine(Value);
 
-/// Bounded, multiplexed JSONL transport for one `codex app-server` process.
+/// Bounded, multiplexed protocol connection to a Codex session service.
 #[derive(Debug)]
 pub(crate) struct CodexRpcClient {
     outbound: mpsc::Sender<OutboundLine>,
     pending: PendingRequests,
     inbound: broadcast::Sender<RpcInbound>,
-    child: Mutex<Child>,
-    process_tree: ProcessTree,
+    child: Mutex<Option<Child>>,
+    process_tree: Option<ProcessTree>,
+    tasks: Mutex<Vec<tokio::task::AbortHandle>>,
     next_id: std::sync::atomic::AtomicU64,
     request_timeout: Duration,
     closed: Arc<AtomicBool>,
@@ -119,17 +122,36 @@ impl CodexRpcClient {
             outbound,
             pending: Arc::clone(&pending),
             inbound: inbound.clone(),
-            child: Mutex::new(child),
-            process_tree,
+            child: Mutex::new(Some(child)),
+            process_tree: Some(process_tree),
+            tasks: Mutex::new(Vec::new()),
             next_id: std::sync::atomic::AtomicU64::new(1),
             request_timeout,
             closed: Arc::clone(&closed),
             loaded_threads: Mutex::new(HashSet::new()),
         });
 
-        tokio::spawn(write_loop(stdin, outbound_rx, Arc::clone(&closed)));
-        tokio::spawn(read_loop(stdout, pending, inbound, closed));
-        tokio::spawn(async move {
+        let writer = FramedWrite::new(
+            stdin,
+            LinesCodec::new_with_max_length(MAX_PROTOCOL_LINE_BYTES),
+        )
+        .with(|text: String| {
+            futures::future::ready(Ok::<String, tokio_util::codec::LinesCodecError>(text))
+        })
+        .sink_map_err(|error| {
+            ProviderError::Process(format!("Codex protocol write failed: {error}"))
+        });
+        let reader = FramedRead::new(
+            BufReader::new(stdout),
+            LinesCodec::new_with_max_length(MAX_PROTOCOL_LINE_BYTES),
+        )
+        .map(|line| line.map_err(|error| error.to_string()));
+        let mut tasks = client.tasks.lock().await;
+        tasks.push(
+            tokio::spawn(write_loop(writer, outbound_rx, Arc::clone(&closed))).abort_handle(),
+        );
+        tasks.push(tokio::spawn(read_loop(reader, pending, inbound, closed)).abort_handle());
+        tasks.push(tokio::spawn(async move {
             let mut lines = FramedRead::new(
                 BufReader::new(stderr),
                 LinesCodec::new_with_max_length(MAX_PROTOCOL_LINE_BYTES),
@@ -147,8 +169,83 @@ impl CodexRpcClient {
                     }
                 }
             }
-        });
+        }).abort_handle());
+        drop(tasks);
 
+        client.initialize().await?;
+        Ok(client)
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn connect(
+        socket_path: &std::path::Path,
+        channel_capacity: usize,
+        request_timeout: Duration,
+    ) -> Result<Arc<Self>, ProviderError> {
+        use tokio::net::UnixStream;
+        use tokio_tungstenite::{
+            client_async_with_config,
+            tungstenite::{Message, protocol::WebSocketConfig},
+        };
+
+        let stream = timeout(request_timeout, UnixStream::connect(socket_path))
+            .await
+            .map_err(|_| {
+                ProviderError::Process("native Codex socket connection timed out".to_owned())
+            })??;
+        let configuration = WebSocketConfig::default()
+            .max_message_size(Some(MAX_PROTOCOL_LINE_BYTES))
+            .max_frame_size(Some(MAX_PROTOCOL_LINE_BYTES));
+        let (websocket, _) = timeout(
+            request_timeout,
+            client_async_with_config("ws://localhost/", stream, Some(configuration)),
+        )
+        .await
+        .map_err(|_| ProviderError::Process("native Codex handshake timed out".to_owned()))?
+        .map_err(|error| {
+            ProviderError::Protocol(format!("native Codex handshake failed: {error}"))
+        })?;
+        let (writer, reader) = websocket.split();
+        let writer = writer
+            .with(|text: String| {
+                futures::future::ready(Ok::<Message, tokio_tungstenite::tungstenite::Error>(
+                    Message::text(text),
+                ))
+            })
+            .sink_map_err(|error| {
+                ProviderError::Process(format!("native Codex write failed: {error}"))
+            });
+        let reader = reader.filter_map(|frame| {
+            futures::future::ready(match frame {
+                Ok(Message::Text(text)) => Some(Ok(text.to_string())),
+                Ok(Message::Ping(_) | Message::Pong(_)) => None,
+                Ok(Message::Close(_)) => Some(Err("native Codex connection closed".to_owned())),
+                Ok(_) => Some(Err("native Codex sent a non-text protocol frame".to_owned())),
+                Err(error) => Some(Err(error.to_string())),
+            })
+        });
+        let (outbound, outbound_rx) = mpsc::channel(channel_capacity.max(1));
+        let (inbound, _) = broadcast::channel(channel_capacity.max(16));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let closed = Arc::new(AtomicBool::new(false));
+        let client = Arc::new(Self {
+            outbound,
+            pending: Arc::clone(&pending),
+            inbound: inbound.clone(),
+            child: Mutex::new(None),
+            process_tree: None,
+            tasks: Mutex::new(Vec::new()),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+            request_timeout,
+            closed: Arc::clone(&closed),
+            loaded_threads: Mutex::new(HashSet::new()),
+        });
+        let mut tasks = client.tasks.lock().await;
+        tasks.push(
+            tokio::spawn(write_loop(writer, outbound_rx, Arc::clone(&closed))).abort_handle(),
+        );
+        tasks.push(tokio::spawn(read_loop(reader, pending, inbound, closed)).abort_handle());
+        drop(tasks);
         client.initialize().await?;
         Ok(client)
     }
@@ -249,36 +346,49 @@ impl CodexRpcClient {
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), ProviderError> {
-        let mut child = self.child.lock().await;
-        let root_running = child.try_wait().map_err(ProviderError::Io)?.is_none();
-        let terminated = self
-            .process_tree
-            .terminate()
-            .map_err(|error| ProviderError::Process(error.to_string()));
-        if root_running {
-            child.wait().await.map_err(ProviderError::Io)?;
+        self.closed.store(true, Ordering::Release);
+        for task in self.tasks.lock().await.iter() {
+            task.abort();
         }
-        terminated
+        fail_pending(&self.pending, "Codex connection shut down".to_owned()).await;
+        let mut child = self.child.lock().await;
+        if let (Some(child), Some(process_tree)) = (child.as_mut(), self.process_tree.as_ref()) {
+            let root_running = child.try_wait().map_err(ProviderError::Io)?.is_none();
+            let terminated = process_tree
+                .terminate()
+                .map_err(|error| ProviderError::Process(error.to_string()));
+            if root_running {
+                child.wait().await.map_err(ProviderError::Io)?;
+            }
+            terminated?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CodexRpcClient {
+    fn drop(&mut self) {
+        for task in self.tasks.get_mut().iter() {
+            task.abort();
+        }
     }
 }
 
 async fn write_loop(
-    mut stdin: ChildStdin,
+    mut writer: impl Sink<String, Error = ProviderError> + Unpin,
     mut receiver: mpsc::Receiver<OutboundLine>,
     closed: Arc<AtomicBool>,
 ) {
     while let Some(OutboundLine(value)) = receiver.recv().await {
-        let encoded = match serde_json::to_vec(&value) {
+        let encoded = match serde_json::to_string(&value) {
             Ok(encoded) => encoded,
             Err(error) => {
                 tracing::error!(provider = %ProviderKind::Codex, %error, "failed to encode request");
                 continue;
             }
         };
-        if stdin.write_all(&encoded).await.is_err()
-            || stdin.write_all(b"\n").await.is_err()
-            || stdin.flush().await.is_err()
-        {
+        if let Err(error) = writer.send(encoded).await {
+            tracing::warn!(provider = %ProviderKind::Codex, %error, "Codex connection write failed");
             break;
         }
     }
@@ -286,15 +396,11 @@ async fn write_loop(
 }
 
 async fn read_loop(
-    stdout: tokio::process::ChildStdout,
+    mut lines: impl Stream<Item = Result<String, String>> + Unpin,
     pending: PendingRequests,
     inbound: broadcast::Sender<RpcInbound>,
     closed: Arc<AtomicBool>,
 ) {
-    let mut lines = FramedRead::new(
-        BufReader::new(stdout),
-        LinesCodec::new_with_max_length(MAX_PROTOCOL_LINE_BYTES),
-    );
     while let Some(line) = lines.next().await {
         let line = match line {
             Ok(line) => line,
@@ -511,11 +617,14 @@ sleep 1
                 .trim()
                 .is_empty()
         );
-        let group = client.process_tree.id();
-        tokio::time::timeout(Duration::from_secs(2), client.child.lock().await.wait())
-            .await
-            .unwrap()
-            .unwrap();
+        let group = client.process_tree.as_ref().unwrap().id();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.child.lock().await.as_mut().unwrap().wait(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(process_group_exists(group).unwrap());
 
         client.shutdown().await.unwrap();

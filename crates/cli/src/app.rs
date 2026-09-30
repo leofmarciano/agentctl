@@ -1,3 +1,5 @@
+// ABOUTME: Coordinates native provider launches, handoffs, and canonical history capture.
+// ABOUTME: Enforces workspace and session integrity across CLI operations.
 //! Application composition root. This is the only layer that knows concrete
 //! storage, provider protocol, native process, and workspace types.
 
@@ -909,7 +911,7 @@ async fn reconcile_codex_launch(
         mark_codex_launch_uncertain(store, config, launch, &error)?;
         return Err(error);
     }
-    capture_codex_native_history(store, paths, config, session, identity, &native_session)
+    capture_codex_native_history(store, paths, config, session, &native_session)
         .await
         .context("failed to reconcile the unfinished native Codex transcript")?;
     let switching_provider =
@@ -1299,11 +1301,10 @@ async fn run_native_codex(
             &native_session.native_session_id,
         )?;
 
-        // Reopen the official app-server only after the native CLI releases the thread,
-        // then capture the native delta into the canonical log.
+        // Read persisted native turns through the official app-server without
+        // acquiring the thread's writer, then capture its terminal delta.
         let capture =
-            capture_codex_native_history(store, paths, config, session, identity, &native_session)
-                .await?;
+            capture_codex_native_history(store, paths, config, session, &native_session).await?;
         store.update_native_launch(
             launch_id,
             NativeLaunchState::Captured,
@@ -1508,26 +1509,16 @@ async fn capture_codex_native_history(
     paths: &AgentctlPaths,
     config: &Config,
     session: &UnifiedSession,
-    identity: &WorkspaceIdentity,
     native_session: &NativeSession,
 ) -> Result<operations::NativeImportReport> {
     let provider = load_native_provider(paths, config, &ProviderKind::Codex).await?;
-    let context = SessionContext {
-        unified_session_id: session.id,
-        workspace_root: identity.execution_root().to_path_buf(),
-        workspace_fingerprint: identity.fingerprint.clone(),
-        auth_mode: session.auth_mode,
-    };
     let captured = async {
-        let restored = provider
-            .restore_session(&context, native_session.clone())
-            .await?;
-        let transcript = provider.read_native_history(&restored).await?;
+        let transcript = provider.read_native_history(native_session).await?;
         operations::persist_native_capture(
             store,
             &config.payload_guard()?,
             session,
-            &restored,
+            native_session,
             &transcript,
         )
     }
@@ -1620,7 +1611,7 @@ async fn load_native_provider(
     kind: &ProviderKind,
 ) -> Result<Arc<dyn AgentProvider>> {
     match kind {
-        ProviderKind::Codex => Ok(Arc::new(CodexAdapter::new(
+        ProviderKind::Codex => Ok(Arc::new(CodexAdapter::for_interactive_sessions(
             &config.providers.codex_binary,
             Some(paths.codex_protocol_root()),
         ))),
@@ -2190,6 +2181,61 @@ mod routing_tests {
             checked_at,
             message: None,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a locally installed Codex CLI"]
+    async fn installed_codex_capture_reads_history_without_acquiring_its_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AgentctlPaths::resolve(Some(directory.path().join("home"))).unwrap();
+        let store = operations::open_store(&paths).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let session = create_session(
+            &store,
+            &config,
+            workspace.path(),
+            Some("capture-live-probe"),
+            Some(ProviderKind::Codex),
+        )
+        .unwrap();
+        let identity = WorkspaceIdentity::discover(workspace.path()).unwrap();
+        let context = SessionContext {
+            unified_session_id: session.id,
+            workspace_root: identity.execution_root().to_path_buf(),
+            workspace_fingerprint: identity.fingerprint.clone(),
+            auth_mode: session.auth_mode,
+        };
+        let owner = CodexAdapter::new("codex", None);
+        let native = owner.ensure_session(&context).await.unwrap();
+        let now = Utc::now();
+        store
+            .upsert_provider_session(&ProviderSessionRecord {
+                id: native.id,
+                unified_session_id: session.id,
+                provider: native.provider.clone(),
+                native_session_id: native.native_session_id.clone(),
+                native_version: native.native_version.clone(),
+                last_synced_seq: 0,
+                status: ProviderStatus::Ready,
+                reset_at: None,
+                capabilities: native.capabilities.clone(),
+                metadata: serde_json::json!({}),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        let captured =
+            capture_codex_native_history(&store, &paths, &config, &session, &native).await;
+        owner.shutdown().await.unwrap();
+        captured.unwrap();
+        assert!(
+            store
+                .list_events(session.id, 0, usize::MAX)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

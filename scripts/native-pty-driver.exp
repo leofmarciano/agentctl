@@ -1,4 +1,6 @@
 #!/usr/bin/expect -f
+# ABOUTME: Drives startup and exit of disposable provider-native interactive sessions.
+# ABOUTME: Holds each native UI for lifecycle assertions without submitting model prompts.
 
 # Drives only the lifecycle boundary of a provider-native interactive CLI.
 # It deliberately never submits a conversational prompt.
@@ -105,12 +107,16 @@ while {![native_child_started $child_pid $provider]} {
 }
 
 # Both providers can ask whether a previously unseen worktree is trusted. The
-# smoke owns a brand-new disposable repository, so accepting the default choice
+# smoke owns a brand-new disposable repository, so accepting the trust choice
 # is bounded to test data. If no trust screen appears, these are empty-editor
 # Enter events and do not start a model turn.
 set trust_at [expr {[clock milliseconds] + 2000}]
 while {[clock milliseconds] < $trust_at} {
     expect {
+        -re {Enter y/n:} {
+            after 250
+            send -- "y\r"
+        }
         -re {Do you trust} {
             after 250
             send -- "\r"
@@ -133,6 +139,10 @@ set settle_seconds [expr {max(0, $startup_seconds - 2)}]
 set ready_at [expr {[clock milliseconds] + ($settle_seconds * 1000)}]
 while {[clock milliseconds] < $ready_at} {
     expect {
+        -re {Enter y/n:} {
+            after 250
+            send -- "y\r"
+        }
         -re {Do you trust} {
             after 250
             send -- "\r"

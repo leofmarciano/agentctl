@@ -16,9 +16,15 @@ codex resume THREAD_ID --cd WORKTREE
 `agentctl` inherits stdin, stdout, and stderr so Codex retains its normal
 terminal UI, approvals, tools, MCP servers, configuration, and agent loop.
 
-Around that foreground process, the Codex bridge launches `codex app-server`,
-completes `initialize`/`initialized`, and communicates over bidirectional
-JSON-RPC/JSONL. The control connection is used to:
+On Unix, the interactive bridge connects to the running native Codex daemon
+through its control socket using WebSocket JSON-RPC. It checks the daemon
+report and requires its version to match the selected CLI. Closing the bridge
+connection leaves the shared daemon and other native sessions running.
+
+When no native control endpoint exists, the bridge launches its own
+`codex app-server` and uses JSON-RPC/JSONL over stdio. A discovered endpoint
+that cannot be validated or connected produces an error. Both transports
+complete `initialize`/`initialized`. The control connection is used to:
 
 - create or resume the mapped thread;
 - inject a missing canonical handoff with `thread/inject_items`;
