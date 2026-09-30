@@ -1,3 +1,5 @@
+// ABOUTME: Launches native provider CLIs with inherited terminal IO.
+// ABOUTME: Journals child creation and bounds process-tree cleanup.
 use std::{
     ffi::OsString,
     path::Path,
@@ -104,6 +106,7 @@ pub(crate) async fn launch_codex_with_spawn<F>(
     workspace: &Path,
     native_session_id: &str,
     native_args: &[OsString],
+    endpoint: Option<&Path>,
     on_spawn: F,
 ) -> Result<NativeCliExit>
 where
@@ -123,6 +126,11 @@ where
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
+    if let Some(endpoint) = endpoint {
+        command
+            .arg("--remote")
+            .arg(format!("unix://{}", endpoint.display()));
+    }
     configure_tokio_process_group(&mut command);
     let child = command
         .spawn()
@@ -639,6 +647,7 @@ mod tests {
                 directory.path(),
                 "native-session",
                 &[],
+                None,
                 move |spawn| {
                     callback_observed.store(spawn.pid, Ordering::SeqCst);
                     Ok(())
@@ -692,6 +701,7 @@ mod tests {
                 directory.path(),
                 "native-session",
                 &[],
+                None,
                 |_| bail!("simulated journal failure"),
             )
             .await
@@ -708,6 +718,7 @@ mod tests {
                 directory.path(),
                 "native-session",
                 &[],
+                None,
                 |_| Ok(()),
             )
             .await
@@ -723,6 +734,7 @@ mod tests {
                 directory.path(),
                 "native-session",
                 &[],
+                None,
                 |_| Ok(()),
             )
             .await

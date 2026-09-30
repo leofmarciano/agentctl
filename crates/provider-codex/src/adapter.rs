@@ -1,3 +1,5 @@
+// ABOUTME: Connects Codex native sessions to canonical events and provider operations.
+// ABOUTME: Reads native history and manages the official app-server protocol.
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
@@ -37,6 +39,8 @@ pub struct CodexConfig {
     pub schema_cache_root: Option<PathBuf>,
     pub channel_capacity: usize,
     pub request_timeout: Duration,
+    /// Shares the native CLI service when it is running.
+    pub interactive: bool,
 }
 
 impl Default for CodexConfig {
@@ -46,6 +50,7 @@ impl Default for CodexConfig {
             schema_cache_root: None,
             channel_capacity: 256,
             request_timeout: Duration::from_secs(30),
+            interactive: false,
         }
     }
 }
@@ -108,6 +113,19 @@ impl CodexAdapter {
         Self::from_config(CodexConfig {
             binary: binary.into(),
             schema_cache_root,
+            ..CodexConfig::default()
+        })
+    }
+
+    /// Connects interactive sessions through the same native service as the Codex CLI.
+    pub fn for_interactive_sessions(
+        binary: impl Into<PathBuf>,
+        schema_cache_root: Option<PathBuf>,
+    ) -> Self {
+        Self::from_config(CodexConfig {
+            binary: binary.into(),
+            schema_cache_root,
+            interactive: true,
             ..CodexConfig::default()
         })
     }
@@ -268,6 +286,23 @@ impl CodexAdapter {
             && !client.is_closed()
         {
             return Ok(Arc::clone(client));
+        }
+        #[cfg(unix)]
+        let socket = if self.config.interactive {
+            crate::process::interactive_endpoint(&self.config.binary).await?
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        if let Some(socket) = socket {
+            let client = CodexRpcClient::connect(
+                &socket,
+                self.config.channel_capacity,
+                self.config.request_timeout,
+            )
+            .await?;
+            *connection = Some(Arc::clone(&client));
+            return Ok(client);
         }
         let client = spawn_app_server(
             &self.config.binary,
@@ -527,7 +562,6 @@ impl AgentProvider for CodexAdapter {
         validate_session(session)?;
         self.require_installed_client_method("thread/read").await?;
         let client = self.client().await?;
-        self.ensure_thread_loaded(&client, session, None).await?;
         let response = client
             .request(
                 "thread/read",

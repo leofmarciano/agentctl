@@ -1,3 +1,5 @@
+// ABOUTME: Detects Codex installations and caches their official protocol schemas.
+// ABOUTME: Runs bounded discovery commands and protects private schema artifacts.
 use std::{
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
@@ -234,7 +236,7 @@ async fn valid_client_request_schema(directory: &Path) -> bool {
     serde_json::from_slice::<serde_json::Value>(&encoded).is_ok()
 }
 
-async fn run_output(
+pub(crate) async fn run_output(
     mut command: Command,
     binary: &Path,
     description: &str,

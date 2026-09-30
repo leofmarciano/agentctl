@@ -1,5 +1,9 @@
+// ABOUTME: Dispatches agentctl commands and reports bounded CLI failures.
+// ABOUTME: Preserves native exit codes and blocking hook failure semantics.
 mod app;
 mod args;
+#[cfg(unix)]
+mod codex_launch;
 mod config;
 mod doctor;
 mod native;

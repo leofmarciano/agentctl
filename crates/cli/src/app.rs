@@ -1,3 +1,5 @@
+// ABOUTME: Coordinates native provider launches, handoffs, and canonical history capture.
+// ABOUTME: Enforces workspace and session integrity across CLI operations.
 //! Application composition root. This is the only layer that knows concrete
 //! storage, provider protocol, native process, and workspace types.
 
@@ -903,13 +905,16 @@ async fn reconcile_codex_launch(
     )
     .context("unfinished Codex launch has an invalid thread/list baseline")?;
     let current = snapshot_codex_threads(paths, config, identity).await?;
-    if let Err(error) =
-        validate_codex_thread_continuity(&baseline, &current, &launch.native_session_id)
-    {
+    if let Err(error) = validate_codex_launch_continuity(
+        &baseline,
+        &current,
+        &launch.native_session_id,
+        &launch.metadata,
+    ) {
         mark_codex_launch_uncertain(store, config, launch, &error)?;
         return Err(error);
     }
-    capture_codex_native_history(store, paths, config, session, identity, &native_session)
+    capture_codex_native_history(store, paths, config, session, &native_session)
         .await
         .context("failed to reconcile the unfinished native Codex transcript")?;
     let switching_provider =
@@ -1293,17 +1298,20 @@ async fn run_native_codex(
     .await?;
     let finalized = async {
         let thread_after = snapshot_codex_threads(paths, config, identity).await?;
-        validate_codex_thread_continuity(
+        let launch = store
+            .native_launch(launch_id)?
+            .context("native Codex launch disappeared")?;
+        validate_codex_launch_continuity(
             &thread_baseline,
             &thread_after,
             &native_session.native_session_id,
+            &launch.metadata,
         )?;
 
-        // Reopen the official app-server only after the native CLI releases the thread,
-        // then capture the native delta into the canonical log.
+        // Read persisted native turns through the official app-server without
+        // acquiring the thread's writer, then capture its terminal delta.
         let capture =
-            capture_codex_native_history(store, paths, config, session, identity, &native_session)
-                .await?;
+            capture_codex_native_history(store, paths, config, session, &native_session).await?;
         store.update_native_launch(
             launch_id,
             NativeLaunchState::Captured,
@@ -1362,11 +1370,30 @@ async fn launch_journaled_codex(
         started_at,
         updated_at: started_at,
     })?;
+    #[cfg(unix)]
+    let relay = match crate::codex_launch::Relay::prepare(
+        Path::new(&config.providers.codex_binary),
+        store.clone(),
+        launch_id,
+    )
+    .await
+    {
+        Ok(relay) => relay,
+        Err(error) => {
+            mark_native_launch_after_error(store, config, launch_id, &error, false, None)?;
+            return Err(error);
+        }
+    };
+    #[cfg(unix)]
+    let endpoint = relay.as_ref().map(crate::codex_launch::Relay::endpoint);
+    #[cfg(not(unix))]
+    let endpoint: Option<PathBuf> = None;
     let launched = native::launch_codex_with_spawn(
         &config.providers.codex_binary,
         identity.execution_root(),
         &native_session.native_session_id,
         native_args,
+        endpoint.as_deref(),
         |spawn| {
             store
                 .record_native_launch_pid(launch_id, spawn.pid)
@@ -1374,6 +1401,23 @@ async fn launch_journaled_codex(
         },
     )
     .await;
+    #[cfg(unix)]
+    let launched = match (
+        launched,
+        async {
+            match relay {
+                Some(relay) => relay.finish().await,
+                None => Ok(()),
+            }
+        }
+        .await,
+    ) {
+        (Ok(exit), Ok(())) => Ok(exit),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(teardown)) => {
+            Err(error.context(format!("native Codex relay also failed: {teardown}")))
+        }
+    };
     let native_exit = match launched {
         Ok(native_exit) => native_exit,
         Err(error) => {
@@ -1470,6 +1514,24 @@ async fn snapshot_codex_threads(
     }
 }
 
+fn validate_codex_launch_continuity(
+    before: &InteractiveThreadSnapshot,
+    after: &InteractiveThreadSnapshot,
+    mapped_thread_id: &str,
+    metadata: &serde_json::Value,
+) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(evidence) = metadata.get("codex_evidence") {
+        ensure!(before.cwd == after.cwd, "Codex launch workspace changed");
+        return serde_json::from_value::<crate::codex_launch::Evidence>(evidence.clone())
+            .context("invalid native Codex thread-selection evidence")?
+            .validate(mapped_thread_id);
+    }
+    #[cfg(not(unix))]
+    let _ = metadata;
+    validate_codex_thread_continuity(before, after, mapped_thread_id)
+}
+
 fn validate_codex_thread_continuity(
     before: &InteractiveThreadSnapshot,
     after: &InteractiveThreadSnapshot,
@@ -1508,26 +1570,16 @@ async fn capture_codex_native_history(
     paths: &AgentctlPaths,
     config: &Config,
     session: &UnifiedSession,
-    identity: &WorkspaceIdentity,
     native_session: &NativeSession,
 ) -> Result<operations::NativeImportReport> {
     let provider = load_native_provider(paths, config, &ProviderKind::Codex).await?;
-    let context = SessionContext {
-        unified_session_id: session.id,
-        workspace_root: identity.execution_root().to_path_buf(),
-        workspace_fingerprint: identity.fingerprint.clone(),
-        auth_mode: session.auth_mode,
-    };
     let captured = async {
-        let restored = provider
-            .restore_session(&context, native_session.clone())
-            .await?;
-        let transcript = provider.read_native_history(&restored).await?;
+        let transcript = provider.read_native_history(native_session).await?;
         operations::persist_native_capture(
             store,
             &config.payload_guard()?,
             session,
-            &restored,
+            native_session,
             &transcript,
         )
     }
@@ -1620,7 +1672,7 @@ async fn load_native_provider(
     kind: &ProviderKind,
 ) -> Result<Arc<dyn AgentProvider>> {
     match kind {
-        ProviderKind::Codex => Ok(Arc::new(CodexAdapter::new(
+        ProviderKind::Codex => Ok(Arc::new(CodexAdapter::for_interactive_sessions(
             &config.providers.codex_binary,
             Some(paths.codex_protocol_root()),
         ))),
@@ -2190,6 +2242,157 @@ mod routing_tests {
             checked_at,
             message: None,
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a locally installed Codex CLI"]
+    async fn installed_codex_capture_reads_history_without_acquiring_its_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AgentctlPaths::resolve(Some(directory.path().join("home"))).unwrap();
+        let store = operations::open_store(&paths).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let config = Config::default();
+        let session = create_session(
+            &store,
+            &config,
+            workspace.path(),
+            Some("capture-live-probe"),
+            Some(ProviderKind::Codex),
+        )
+        .unwrap();
+        let identity = WorkspaceIdentity::discover(workspace.path()).unwrap();
+        let context = SessionContext {
+            unified_session_id: session.id,
+            workspace_root: identity.execution_root().to_path_buf(),
+            workspace_fingerprint: identity.fingerprint.clone(),
+            auth_mode: session.auth_mode,
+        };
+        let owner = CodexAdapter::new("codex", None);
+        let native = owner.ensure_session(&context).await.unwrap();
+        let now = Utc::now();
+        store
+            .upsert_provider_session(&ProviderSessionRecord {
+                id: native.id,
+                unified_session_id: session.id,
+                provider: native.provider.clone(),
+                native_session_id: native.native_session_id.clone(),
+                native_version: native.native_version.clone(),
+                last_synced_seq: 0,
+                status: ProviderStatus::Ready,
+                reset_at: None,
+                capabilities: native.capabilities.clone(),
+                metadata: serde_json::json!({}),
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+
+        let captured =
+            capture_codex_native_history(&store, &paths, &config, &session, &native).await;
+        owner.shutdown().await.unwrap();
+        captured.unwrap();
+        assert!(
+            store
+                .list_events(session.id, 0, usize::MAX)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires a running native Codex daemon"]
+    async fn installed_codex_relay_persists_only_its_client_selections() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::{client_async, tungstenite::Message};
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AgentctlPaths::resolve(Some(directory.path().join("home"))).unwrap();
+        let store = operations::open_store(&paths).unwrap();
+        let config = Config::default();
+        let session = create_session(
+            &store,
+            &config,
+            directory.path(),
+            Some("relay-live-probe"),
+            Some(ProviderKind::Codex),
+        )
+        .unwrap();
+        let owner = CodexAdapter::for_interactive_sessions("codex", None);
+        let native = owner
+            .ensure_session(&SessionContext {
+                unified_session_id: session.id,
+                workspace_root: session.workspace_path.clone(),
+                workspace_fingerprint: session.workspace_fingerprint.clone(),
+                auth_mode: session.auth_mode,
+            })
+            .await
+            .unwrap();
+        let id = uuid::Uuid::now_v7();
+        store
+            .start_native_launch(&NativeLaunchRecord {
+                id,
+                session_id: session.id,
+                provider: ProviderKind::Codex,
+                native_session_id: native.native_session_id.clone(),
+                workspace_lease_key: "relay-live-probe".to_owned(),
+                child_pid: None,
+                state: NativeLaunchState::Started,
+                exit_code: None,
+                error: None,
+                metadata: serde_json::json!({"preserved":true}),
+                started_at: Utc::now(),
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+        let relay = crate::codex_launch::Relay::prepare(Path::new("codex"), store.clone(), id)
+            .await
+            .unwrap()
+            .unwrap();
+        let (mut client, _) = client_async(
+            "ws://localhost/",
+            tokio::net::UnixStream::connect(relay.endpoint())
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        for (index, (method, params)) in [
+            ("initialize", serde_json::json!({"clientInfo":{"name":"agentctl-relay-live-probe","version":"0.1.0"},"capabilities":{"experimentalApi":true}})),
+            ("thread/resume", serde_json::json!({"threadId":native.native_session_id})),
+            ("thread/fork", serde_json::json!({"threadId":native.native_session_id})),
+        ].into_iter().enumerate() {
+            client.send(Message::text(serde_json::json!({"id":index,"method":method,"params":params}).to_string())).await.unwrap();
+            loop {
+                let frame = tokio::time::timeout(std::time::Duration::from_secs(30),client.next()).await.unwrap().unwrap().unwrap();
+                if let Message::Text(text) = frame {
+                    let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if response["id"] == index {
+                        assert!(response.get("error").is_none(), "{response}");
+                        break;
+                    }
+                }
+            }
+            if index == 0 {
+                client.send(Message::text(serde_json::json!({"method":"initialized"}).to_string())).await.unwrap();
+            }
+        }
+        let pending: crate::codex_launch::Evidence = serde_json::from_value(
+            store.native_launch(id).unwrap().unwrap().metadata["codex_evidence"].clone(),
+        )
+        .unwrap();
+        assert!(!pending.complete);
+        assert_eq!(pending.selected_threads.len(), 2);
+        client.close(None).await.unwrap();
+        relay.finish().await.unwrap();
+        owner.shutdown().await.unwrap();
+        let reopened = operations::open_store(&paths).unwrap();
+        let launch = reopened.native_launch(id).unwrap().unwrap();
+        assert_eq!(launch.metadata["preserved"], true);
+        let evidence: crate::codex_launch::Evidence =
+            serde_json::from_value(launch.metadata["codex_evidence"].clone()).unwrap();
+        assert!(evidence.complete);
+        assert_eq!(evidence.pending_requests, 0);
+        assert!(evidence.validate(&native.native_session_id).is_err());
     }
 
     #[test]
@@ -3209,6 +3412,23 @@ mod tests {
             threads: vec![thread("mapped", "tree-a", 2), thread("other", "tree-b", 1)],
         };
         validate_codex_thread_continuity(&before, &after, "mapped").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_thread_continuity_allows_timestamp_updates_in_existing_siblings() {
+        let cwd = PathBuf::from("/tmp/agentctl-worktree");
+        let before = InteractiveThreadSnapshot {
+            cwd: cwd.clone(),
+            threads: vec![thread("mapped", "tree-a", 1), thread("other", "tree-b", 1)],
+        };
+        let after = InteractiveThreadSnapshot {
+            cwd,
+            threads: vec![thread("mapped", "tree-a", 2), thread("other", "tree-b", 2)],
+        };
+        validate_codex_launch_continuity(&before, &after, "mapped", &serde_json::json!({
+            "codex_evidence": {"selected_threads": ["mapped"], "pending_requests": 0, "complete": true, "error": null}
+        })).unwrap();
     }
 
     #[test]

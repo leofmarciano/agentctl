@@ -1,3 +1,5 @@
+// ABOUTME: Persists canonical sessions and native lifecycle evidence in SQLite.
+// ABOUTME: Validates bounded records and enforces durable state transitions.
 use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
@@ -592,6 +594,52 @@ impl SqliteStore {
                 timestamp(record.updated_at),
             ],
         )?;
+        Ok(())
+    }
+
+    /// Persists launch-specific Codex observations without replacing other lifecycle metadata.
+    pub fn update_codex_launch_evidence(
+        &self,
+        id: uuid::Uuid,
+        evidence: &serde_json::Value,
+    ) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (provider, state, mut metadata): (ProviderKind, NativeLaunchState, serde_json::Value) =
+            transaction
+                .query_row(
+                    "SELECT provider_json, state, metadata_json FROM native_launches WHERE id = ?1",
+                    [id.to_string()],
+                    |row| {
+                        Ok((
+                            decode_row(row.get::<_, String>(0)?, 0)?,
+                            NativeLaunchState::parse(&row.get::<_, String>(1)?)?,
+                            decode_row(row.get::<_, String>(2)?, 2)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| StorageError::NotFound(format!("native launch {id}")))?;
+        if provider != ProviderKind::Codex
+            || !matches!(
+                state,
+                NativeLaunchState::Started | NativeLaunchState::Exited
+            )
+        {
+            return Err(StorageError::InvalidData(
+                "Codex evidence requires an active Codex launch".to_owned(),
+            ));
+        }
+        metadata["codex_evidence"] = evidence.clone();
+        validate_json(&metadata, self.limits)?;
+        expect_one(
+            transaction.execute(
+                "UPDATE native_launches SET metadata_json = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id.to_string(), encode(&metadata)?, timestamp(Utc::now())],
+            )?,
+            format!("native launch {id}"),
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2498,14 +2546,24 @@ mod tests {
                 state: NativeLaunchState::Started,
                 exit_code: None,
                 error: None,
-                metadata: serde_json::json!({}),
+                metadata: serde_json::json!({"preserved": true}),
                 started_at: now,
                 updated_at: now,
             })
             .unwrap();
+        let evidence = serde_json::json!({"selected_threads": ["thread-native"], "complete": true});
+        store.update_codex_launch_evidence(id, &evidence).unwrap();
         drop(store);
 
         let reopened = SqliteStore::open(&database).unwrap();
+        assert_eq!(
+            reopened.native_launch(id).unwrap().unwrap().metadata["codex_evidence"],
+            evidence
+        );
+        assert_eq!(
+            reopened.native_launch(id).unwrap().unwrap().metadata["preserved"],
+            true
+        );
         assert_eq!(reopened.open_native_launches(session.id).unwrap().len(), 1);
         reopened
             .update_native_launch(id, NativeLaunchState::Exited, Some(130), None, Utc::now())
@@ -2521,6 +2579,11 @@ mod tests {
         reopened
             .update_native_launch(id, NativeLaunchState::Captured, Some(130), None, Utc::now())
             .unwrap();
+        assert!(
+            reopened
+                .update_codex_launch_evidence(id, &evidence)
+                .is_err()
+        );
         assert!(
             reopened
                 .open_native_launches(session.id)

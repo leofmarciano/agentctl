@@ -16,15 +16,38 @@ codex resume THREAD_ID --cd WORKTREE
 `agentctl` inherits stdin, stdout, and stderr so Codex retains its normal
 terminal UI, approvals, tools, MCP servers, configuration, and agent loop.
 
-Around that foreground process, the Codex bridge launches `codex app-server`,
-completes `initialize`/`initialized`, and communicates over bidirectional
-JSON-RPC/JSONL. The control connection is used to:
+On Unix, the interactive bridge connects to the running native Codex daemon
+through its control socket using WebSocket JSON-RPC. It checks the daemon
+report and requires its version to match the selected CLI. Closing the bridge
+connection leaves the shared daemon and other native sessions running.
+
+When no native control endpoint exists, the bridge launches its own
+`codex app-server` and uses JSON-RPC/JSONL over stdio. A discovered endpoint
+that cannot be validated or connected produces an error. Both transports
+complete `initialize`/`initialized`. The control connection is used to:
 
 - create or resume the mapped thread;
 - inject a missing canonical handoff with `thread/inject_items`;
 - read the thread with `thread/read(includeTurns=true)` after native exit;
 - inspect account, capability, usage, and rate-limit signals;
 - generate and cache the installed version's JSON Schema.
+
+With a running native daemon on Unix, each Codex CLI launch connects through a
+private local relay using the CLI's `--remote` option. Relay endpoints last for
+one launch; reopen with `agentctl open codex --session NAME` after exit.
+The relay forwards native
+protocol traffic and journals successful thread selections from that connection.
+It stores thread IDs, pending selection count, and completion state; prompts and
+tool payloads are not stored in this evidence. Ephemeral `thread_title` requests
+are background title generation and do not select a conversation. Other thread
+selections remain subject to continuity validation. Unrelated clients can update or
+create sibling threads without being attributed to the mapped launch.
+
+Capture and recovery require complete evidence selecting only the mapped thread.
+Native `/new`, `/fork`, or `/resume` to another thread remain detectable even if
+the CLI returns to the mapped thread before exiting. Missing responses or a failed
+relay block automatic capture. Launches without a relay retain the conservative
+workspace snapshot check, including launches already journaled with that format.
 
 External Claude messages can be injected as real user and assistant transcript
 items without starting a Codex model turn. Synthetic tool calls are never
